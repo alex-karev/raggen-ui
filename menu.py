@@ -8,172 +8,162 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QHBoxLayout,
     QPushButton,
-    QTextEdit,
-    QFileDialog
+    QFileDialog,
 )
-from PySide6.QtCore import Qt, Slot, QThread, Signal, QObject
-from typing import Any, Callable, Optional, List
-import os
+from PySide6.QtCore import Qt, Signal
 from pathlib import Path
-from translations import AppLanguage
+import os
 from core import AppSettings, save_config
 
-SUPPORTED_FORMATS = [".pdf", ".docx", ".doc", ".md", ".html", ".html"]
-
-# Task thread
-class TaskWorker(QObject):
-    result = Signal(object)
-    finished = Signal()
-
-    def __init__(self, function: Callable):
-        super().__init__()
-        self.input: Any = input
-        self.function: Callable = function
-
-    @Slot(str)
-    def do_work(self, input):
-        output: Any = self.function(input)
-        self.result.emit(output)
-        self.finished.emit()
+SUPPORTED_FORMATS = [".pdf", ".docx", ".md", ".html"]
 
 
-# Main control area
 class EditorMenu(QWidget):
+    task_started = Signal()  # Signal to trigger processing
+    file_selected = Signal(str)  # Signal to trigger file selection
+    file_saved = Signal(str)  # Signal to trigger file save
+
     def __init__(
-        self,
-        prefs: AppSettings = AppSettings(),
-        lang: AppLanguage = AppLanguage(),
-        preview: Optional[QTextEdit] = None,
-        fields: List[str] = [],
-        title: str = "Undefined",
-        select: Optional[Callable] = None,
-        function: Optional[Callable] = None,
-        callback: Optional[Callable] = None,
+        self, prefs: AppSettings, lang, title: str, fields: list[str], function
     ):
         super().__init__()
-        self.prefs: AppSettings = prefs
-        self.lang: AppLanguage = lang
-        self.preview = preview
-        self.function: Callable = (
-            function if function else lambda x, y,: print("Unimplemented")
-        )
-        self.callback: Callable = (
-            callback if callback else lambda x: print("Empty callaback")
-        )
+        self.prefs = prefs
+        self.lang = lang
+        self.function = function
+        self.selected_file = ""
+        self.save_file = ""
 
-        # Define layout
+        # Layout setup
         layout = QVBoxLayout(self)
 
         # Title
-        title = QLabel(title)
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        title_label = QLabel(title)
+        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title_label)
 
-        # Twekable settins
-        settings = QWidget()
-        settings_layout = QVBoxLayout(settings)
+        # Settings section
         self.fields = {}
+        settings_widget = QWidget()
+        settings_layout = QVBoxLayout(settings_widget)
+
+        # File selector
+        if "file" in fields:
+            self.file_button = QPushButton(self.lang.select)
+            self.file_button.clicked.connect(self.select_file)
+            settings_layout.addWidget(QLabel(self.lang.document))
+            settings_layout.addWidget(self.file_button)
+
+        # "Save" button if "save" field is in fields
+        if "save" in fields:
+            self.save_button = QPushButton(self.lang.save)
+            self.save_button.clicked.connect(self.save_file_dialog)
+            settings_layout.addWidget(self.save_button)
+
+        # Preferences
         for field in fields:
-            # Special case: file input
-            if field == "file":
-                label = QLabel(self.lang.document)
-                file_button = QPushButton(self.lang.select)
-                settings_layout.addWidget(label)
-                settings_layout.addWidget(file_button)
-                file_button.clicked.connect(self.select_file)
+            if field in ["file", "save"]:
                 continue
-            # Common case
-            value = self.prefs.__getattribute__(field)
-            label = QLabel(self.lang.__getattribute__(field))
-            if isinstance(value, str):
-                field_edit = QLineEdit()
-                field_edit.setText(value)
-                field_edit.textChanged.connect(self.settings_changed(field))
+            value = prefs.__getattribute__(field)
+            if isinstance(value, int) and not isinstance(value, bool):
+                self.create_setting(settings_layout, field, QSpinBox, 64, 0, 8192)
             elif isinstance(value, bool):
-                field_edit = QCheckBox()
-                field_edit.setChecked(value)
-                field_edit.stateChanged.connect(self.settings_changed(field))
-            elif isinstance(value, int):
-                field_edit = QSpinBox()
-                field_edit.setSingleStep(64)
-                field_edit.setRange(0, 8192)
-                field_edit.wheelEvent = lambda *event: None
-                field_edit.setValue(value)
-                field_edit.valueChanged.connect(self.settings_changed(field))
-            settings_layout.addWidget(label)
-            settings_layout.addWidget(field_edit)
+                self.create_setting(settings_layout, field, QCheckBox)
+            else:
+                self.create_setting(settings_layout, field, QLineEdit)
 
-        # Wrap settings into a scrollable area
+        # Scrollable settings area
         scroll_area = QScrollArea()
-        scroll_area.setWidget(settings)
+        scroll_area.setWidget(settings_widget)
         scroll_area.setWidgetResizable(True)
+        layout.addWidget(scroll_area)
 
-        # Bottom section with the next button
+        # Bottom section with "Next" button
         bottom_section = QWidget()
         bottom_layout = QHBoxLayout(bottom_section)
         bottom_layout.addStretch()
-        self.next_button = QPushButton(self.lang.next)
-        if "file" in fields:
-            self.next_button.setDisabled(True)
-        bottom_layout.addWidget(self.next_button)
+        if not "save" in fields:
+            self.next_button = QPushButton(self.lang.next)
+            if "file" in fields:
+                self.next_button.setDisabled(True)  # Enabled after file selection
+            self.next_button.clicked.connect(self.start_task)
+            bottom_layout.addWidget(self.next_button)
         bottom_layout.addStretch()
-
-        # Add sections
-        layout.addWidget(title)
-        layout.addWidget(scroll_area)
         layout.addWidget(bottom_section)
 
-        # Connect next button
-        self.next_button.clicked.connect(self.start_task)
+    def create_setting(self, layout, key, widget_class, step=1, min_val=0, max_val=100):
+        """Dynamically creates UI elements for settings"""
+        label = QLabel(self.lang.__getattribute__(key))
+        layout.addWidget(label)
 
-    # Select file
+        if widget_class == QSpinBox:
+            widget = QSpinBox()
+            widget.setSingleStep(step)
+            widget.setRange(min_val, max_val)
+            widget.setValue(getattr(self.prefs, key, 0))
+            widget.valueChanged.connect(
+                lambda value: self.update_preference(key, value)
+            )
+        elif widget_class == QCheckBox:
+            widget = QCheckBox()
+            widget.setChecked(getattr(self.prefs, key, False))
+            widget.stateChanged.connect(
+                lambda state: self.update_preference(key, bool(state))
+            )
+        elif widget_class == QLineEdit:
+            widget = QLineEdit()
+            widget.setText(getattr(self.prefs, key, ""))
+            widget.textChanged.connect(lambda text: self.update_preference(key, text))
+
+        layout.addWidget(widget)
+        self.fields[key] = widget
+
     def select_file(self):
+        """Open file dialog and validate selection"""
         file_dialog = QFileDialog(self)
-        if os.path.exists(self.prefs.file_path):
-            file_dialog.setDirectory(self.prefs.file_path)
         file_dialog.setWindowTitle(self.lang.document)
         file_dialog.setFileMode(QFileDialog.ExistingFile)
+
+        if os.path.exists(self.prefs.file_path):
+            file_dialog.setDirectory(self.prefs.file_path)
+
         if file_dialog.exec():
             selected_file = file_dialog.selectedFiles()[0]
             filepath = Path(selected_file)
-            format = filepath.suffix.lower()
-            self.prefs.file_path = str(filepath.parent.absolute())
-            save_config(self.prefs)
-            if not format in SUPPORTED_FORMATS:
-                print(self.lang.format_unsupported.format(format))
+            if filepath.suffix.lower() not in SUPPORTED_FORMATS:
+                print(self.lang.format_unsupported.format(filepath.suffix))
                 return
-            self.preview.setText(selected_file)
-            self.next_button.setDisabled(False)
-            print(self.lang.document_selected.format(selected_file))
 
-    # Edit preferences
-    def settings_changed(self, key: str):
-        def wrapper(text: str):
-            value = self.prefs.__getattribute__(key)
-            if isinstance(value, int):
-                new_value = int(text)
-            elif isinstance(value, bool):
-                new_value = value == Qt.CheckState.Checked.value
-            else:
-                new_value = text
-            self.prefs.__setattr__(key, new_value)
-            save_config(self.prefs)
+            self.selected_file = str(filepath)
+            self.update_preference("file_path", str(Path(self.selected_file).parent.absolute()))
+            self.next_button.setDisabled(False)  # Enable processing
+            print(self.lang.document_selected.format(self.selected_file))
+        self.file_selected.emit(self.selected_file)
 
-        return wrapper
+    def save_file_dialog(self):
+        """Open save file dialog and emit file_saved signal"""
+        save_dialog = QFileDialog(self)
+        save_dialog.setWindowTitle(self.lang.save_as)
+        save_dialog.setFileMode(QFileDialog.AnyFile)
+        
+        default_filename = self.prefs.save_path
+        save_dialog.setDefaultSuffix(".json")
+        save_dialog.selectFile(default_filename)
 
-    # Start task
+        if save_dialog.exec():
+            save_path = save_dialog.selectedFiles()[0]
+            if save_path:
+                self.save_file = save_path
+                self.update_preference("save_path", self.save_file)
+                self.file_saved.emit(self.save_file)  # Emit the file_saved signal
+
+    def update_preference(self, key, value):
+        """Update settings and save configuration"""
+        setattr(self.prefs, key, value)
+        save_config(self.prefs)
+
     def start_task(self):
-        self.setDisabled(True)
-        self.thread = QThread()
-        self.worker = TaskWorker(self.function)
-        self.worker.moveToThread(self.thread)
-        self.thread.started.connect(
-            lambda: self.worker.do_work(self.preview.toPlainText())
-        )
-        self.worker.finished.connect(self.thread.quit)
-        self.worker.result.connect(self.finish_task)
-        self.thread.start()
-
-    # Finish task
-    def finish_task(self, output: Any):
-        self.setDisabled(False)
-        self.callback(output)
+        """Emit signal to trigger processing in main editor"""
+        self.next_button.setDisabled(True)
+        if hasattr(self, "file_button"):
+            self.file_button.setDisabled(True)
+        self.task_started.emit()

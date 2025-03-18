@@ -23,10 +23,8 @@ class TabbedApp(QMainWindow):
         #self.setGeometry(100, 100, 300, 200)
         
         # Create a QTabWidget
-        self.tab_widget = QTabWidget()
-        self.tab_widget.addTab(Editor(self.prefs, self.lang), "Tab 1")
-        self.tab_widget.addTab(QLabel("LOOL"), "Tab 2")
-        self.setCentralWidget(self.tab_widget)
+        self.editor = Editor(self.prefs, self.lang)
+        self.setCentralWidget(self.editor)
    
 # Start app
 if __name__ == "__main__":
